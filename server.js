@@ -19,7 +19,7 @@ wss.on('connection', (ws) => {
             case 'rematch':
                 handleRematch(ws, data);
                 break;
-            'leave':
+            case 'leave':
                 handleLeave(ws, data);
                 break;
         }
@@ -80,7 +80,7 @@ function handleMove(ws, data) {
 
     if (ws.playerSymbol !== room.currentPlayer || room.gameState[data.index]) return;
 
-    room.gameState[data.index] = ws.playerSymbol;
+    room.gameState = data.index](ws.playerSymbol);
     room.currentPlayer = room.currentPlayer === 'X' ? 'O' : 'X';
 
     const winner = checkWinner(room.gameState);
