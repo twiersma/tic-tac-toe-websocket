@@ -1,0 +1,15 @@
+{
+  "name": "tic-tac-toe-websocket",
+  "version": "1.0.0",
+  "description": "WebSocket server for Tic Tac Toe multiplayer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}
