@@ -1,29 +1,26 @@
-// server.js (Polished version with game IDs, optional spectators, and stat tracking)
+// Enhanced WebSocket server for Tic Tac Toe with game cleanup, UUID game IDs, and optional stats
 const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid'); // Requires: npm install uuid
+const { v4: uuidv4 } = require('uuid');
 
 const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
 
-const games = new Map(); // Map<gameId, gameObject>
-const playerStats = new Map(); // Map<playerId, { wins, losses, draws }>
+const games = new Map(); // Map of gameId -> game object
 
 function createGame() {
     const gameId = uuidv4();
     const game = {
         id: gameId,
-        players: [], // { ws, symbol, id }
-        spectators: [],
+        players: [], // { ws, symbol, lastSeen }
         gameState: Array(9).fill(null),
         currentPlayer: 'X',
-        createdAt: Date.now(),
-        timeout: null
+        lastUpdated: Date.now()
     };
     games.set(gameId, game);
     return game;
 }
 
-function findOrCreateGame() {
-    for (let game of games.values()) {
+function findAvailableGame() {
+    for (const game of games.values()) {
         if (game.players.length < 2) return game;
     }
     return createGame();
@@ -35,124 +32,110 @@ function checkWinner(board) {
         [0, 3, 6], [1, 4, 7], [2, 5, 8],
         [0, 4, 8], [2, 4, 6]
     ];
-    for (const [a, b, c] of combos) {
-        if (board[a] && board[a] === board[b] && board[b] === board[c]) {
+    for (let [a, b, c] of combos) {
+        if (board[a] && board[a] === board[b] && board[a] === board[c]) {
             return board[a];
         }
     }
     return null;
 }
 
-function updateStats(playerId, result) {
-    if (!playerStats.has(playerId)) {
-        playerStats.set(playerId, { wins: 0, losses: 0, draws: 0 });
-    }
-    const stats = playerStats.get(playerId);
-    if (result === 'win') stats.wins++;
-    else if (result === 'loss') stats.losses++;
-    else stats.draws++;
+function sendToGame(game, payload) {
+    game.players.forEach(p => {
+        if (p.ws.readyState === WebSocket.OPEN) {
+            p.ws.send(JSON.stringify(payload));
+        }
+    });
+    game.lastUpdated = Date.now();
 }
 
-function broadcast(game, message) {
-    game.players.concat(game.spectators).forEach(p => p.ws.send(JSON.stringify(message)));
+function removeGame(game) {
+    games.delete(game.id);
+    console.log(`Game ${game.id} removed. Active games: ${games.size}`);
 }
+
+// Clean up idle games every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, game] of games.entries()) {
+        const isEmpty = game.players.length === 0;
+        const isIdle = now - game.lastUpdated > 60 * 60 * 1000; // 1 hour
+        if (isEmpty || isIdle) {
+            removeGame(game);
+        }
+    }
+}, 5 * 60 * 1000);
 
 wss.on('connection', (ws) => {
     console.log('New WebSocket connection');
+    const game = findAvailableGame();
+    const symbol = game.players.length === 0 ? 'X' : 'O';
+    const player = { ws, symbol, lastSeen: Date.now() };
+    game.players.push(player);
 
-    const game = findOrCreateGame();
-    let playerId = uuidv4();
+    ws.send(JSON.stringify({
+        type: 'joined',
+        playerSymbol: symbol,
+        gameState: game.gameState,
+        currentPlayer: game.currentPlayer
+    }));
 
-    if (game.players.length < 2) {
-        const symbol = game.players.length === 0 ? 'X' : 'O';
-        game.players.push({ ws, symbol, id: playerId });
-
-        ws.send(JSON.stringify({
-            type: 'joined',
-            playerSymbol: symbol,
-            gameId: game.id,
-            gameState: game.gameState,
+    if (game.players.length === 1) {
+        ws.send(JSON.stringify({ type: 'waiting' }));
+    } else if (game.players.length === 2) {
+        sendToGame(game, {
+            type: 'start',
             currentPlayer: game.currentPlayer
-        }));
-
-        if (game.players.length === 1) {
-            ws.send(JSON.stringify({ type: 'waiting' }));
-        } else {
-            broadcast(game, {
-                type: 'start',
-                currentPlayer: game.currentPlayer
-            });
-        }
-    } else {
-        game.spectators.push({ ws });
-        ws.send(JSON.stringify({
-            type: 'spectator',
-            gameId: game.id,
-            gameState: game.gameState,
-            currentPlayer: game.currentPlayer
-        }));
+        });
     }
 
     ws.on('message', (msg) => {
-        let data;
         try {
-            data = JSON.parse(msg);
-        } catch (e) {
-            console.error('Invalid JSON:', e);
-            return;
-        }
+            const data = JSON.parse(msg);
+            player.lastSeen = Date.now();
 
-        if (data.type === 'move') {
-            const player = game.players.find(p => p.ws === ws);
-            if (!player || game.currentPlayer !== player.symbol || game.gameState[data.index]) return;
+            if (data.type === 'move' && data.player === game.currentPlayer && !game.gameState[data.index]) {
+                game.gameState[data.index] = data.player;
+                game.currentPlayer = game.currentPlayer === 'X' ? 'O' : 'X';
+                const winner = checkWinner(game.gameState);
+                const gameOver = winner || game.gameState.every(cell => cell);
 
-            game.gameState[data.index] = player.symbol;
-            const winner = checkWinner(game.gameState);
-            const draw = game.gameState.every(cell => cell);
-            const gameOver = !!winner || draw;
-
-            if (gameOver) {
-                const loser = game.players.find(p => p.symbol !== winner)?.id;
-                const winnerId = game.players.find(p => p.symbol === winner)?.id;
-
-                if (winner) {
-                    updateStats(winnerId, 'win');
-                    updateStats(loser, 'loss');
-                } else {
-                    game.players.forEach(p => updateStats(p.id, 'draw'));
-                }
+                sendToGame(game, {
+                    type: 'update',
+                    gameState: game.gameState,
+                    currentPlayer: game.currentPlayer,
+                    gameOver,
+                    winner
+                });
             }
 
-            broadcast(game, {
-                type: 'update',
-                gameState: game.gameState,
-                currentPlayer: game.currentPlayer = game.currentPlayer === 'X' ? 'O' : 'X',
-                gameOver,
-                winner
-            });
-        } else if (data.type === 'rematch') {
-            game.gameState = Array(9).fill(null);
-            game.currentPlayer = 'X';
-            broadcast(game, {
-                type: 'rematch',
-                gameState: game.gameState,
-                currentPlayer: game.currentPlayer
-            });
-        } else if (data.type === 'stats') {
-            const stats = playerStats.get(data.playerId) || { wins: 0, losses: 0, draws: 0 };
-            ws.send(JSON.stringify({ type: 'stats', stats }));
+            else if (data.type === 'rematch') {
+                game.gameState = Array(9).fill(null);
+                game.currentPlayer = 'X';
+                sendToGame(game, {
+                    type: 'rematch',
+                    playerSymbol: player.symbol,
+                    gameState: game.gameState,
+                    currentPlayer: game.currentPlayer
+                });
+            }
+
+            else if (data.type === 'leave') {
+                game.players = game.players.filter(p => p.ws !== ws);
+                sendToGame(game, { type: 'opponent_left' });
+            }
+
+        } catch (err) {
+            console.error('Invalid message:', err);
         }
     });
 
     ws.on('close', () => {
         game.players = game.players.filter(p => p.ws !== ws);
-        game.spectators = game.spectators.filter(s => s.ws !== ws);
-
-        if (game.players.length === 0 && game.spectators.length === 0) {
-            games.delete(game.id);
-            console.log(`Game ${game.id} removed`);
+        if (game.players.length > 0) {
+            sendToGame(game, { type: 'opponent_left' });
         } else {
-            broadcast(game, { type: 'opponent_left' });
+            removeGame(game);
         }
     });
 });
