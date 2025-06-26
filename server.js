@@ -1,36 +1,40 @@
+// Enhanced Tic Tac Toe WebSocket server
 const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const { v4: uuidv4 } = require('uuid'); // For optional player IDs
 
-const games = []; // Array of games, each with { players: [{ws, symbol}], gameState, currentPlayer }
+const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const games = []; // Tracks all active games
 
 function createGame() {
     return {
+        id: uuidv4(),
         players: [],
         gameState: Array(9).fill(null),
-        currentPlayer: 'X'
+        currentPlayer: 'X',
+        lastActivity: Date.now()
     };
 }
 
 function findAvailableGame() {
-    // Return an existing game with < 2 players, or create a new one
     let game = games.find(g => g.players.length < 2);
     if (!game) {
         game = createGame();
         games.push(game);
-        console.log(`Created new game. Total games: ${games.length}`);
+        console.log(`Created new game (ID: ${game.id}). Total games: ${games.length}`);
     }
     return game;
 }
 
 function checkWinner(board) {
-    const winningCombinations = [
+    const winningCombos = [
         [0, 1, 2], [3, 4, 5], [6, 7, 8],
         [0, 3, 6], [1, 4, 7], [2, 5, 8],
         [0, 4, 8], [2, 4, 6]
     ];
-    for (let combo of winningCombinations) {
-        if (board[combo[0]] && board[combo[0]] === board[combo[1]] && board[combo[0]] === board[combo[2]]) {
-            return board[combo[0]];
+    for (let combo of winningCombos) {
+        const [a, b, c] = combo;
+        if (board[a] && board[a] === board[b] && board[a] === board[c]) {
+            return board[a];
         }
     }
     return null;
@@ -46,79 +50,98 @@ wss.on('connection', (ws) => {
         type: 'joined',
         playerSymbol,
         gameState: game.gameState,
-        currentPlayer: game.currentPlayer
+        currentPlayer: game.currentPlayer,
+        gameId: game.id
     }));
-    console.log(`Player ${playerSymbol} joined game ${games.indexOf(game)}. Players in game: ${game.players.length}`);
 
     if (game.players.length === 1) {
         ws.send(JSON.stringify({ type: 'waiting' }));
     } else if (game.players.length === 2) {
-        game.players.forEach(p => {
-            p.ws.send(JSON.stringify({
-                type: 'start',
-                currentPlayer: game.currentPlayer
-            }));
+        broadcast(game, {
+            type: 'start',
+            currentPlayer: game.currentPlayer
         });
-        console.log(`Game ${games.indexOf(game)} started with players X and O`);
     }
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`Received message in game ${games.indexOf(game)}:`, data);
+            game.lastActivity = Date.now();
 
-            if (data.type === 'move' && data.player === game.currentPlayer && !game.gameState[data.index]) {
-                game.gameState[data.index] = data.player;
-                game.currentPlayer = game.currentPlayer === 'X' ? 'O' : 'X';
-                const winner = checkWinner(game.gameState);
-                const gameOver = winner || game.gameState.every(cell => cell);
-                game.players.forEach(p => {
-                    p.ws.send(JSON.stringify({
-                        type: 'update',
-                        gameState: game.gameState,
-                        currentPlayer: game.currentPlayer,
-                        gameOver,
-                        winner
-                    }));
-                });
-                console.log(`Game ${games.indexOf(game)} updated: currentPlayer=${game.currentPlayer}, gameOver=${gameOver}, winner=${winner}`);
-            } else if (data.type === 'rematch') {
-                game.gameState = Array(9).fill(null);
-                game.currentPlayer = 'X';
-                game.players.forEach(p => {
-                    p.ws.send(JSON.stringify({
+            switch (data.type) {
+                case 'move':
+                    if (
+                        data.player === game.currentPlayer &&
+                        Number.isInteger(data.index) &&
+                        data.index >= 0 &&
+                        data.index < 9 &&
+                        !game.gameState[data.index]
+                    ) {
+                        game.gameState[data.index] = data.player;
+                        game.currentPlayer = game.currentPlayer === 'X' ? 'O' : 'X';
+
+                        const winner = checkWinner(game.gameState);
+                        const gameOver = winner || game.gameState.every(Boolean);
+
+                        broadcast(game, {
+                            type: 'update',
+                            gameState: game.gameState,
+                            currentPlayer: game.currentPlayer,
+                            gameOver,
+                            winner
+                        });
+                    }
+                    break;
+                case 'rematch':
+                    game.gameState = Array(9).fill(null);
+                    game.currentPlayer = 'X';
+                    broadcast(game, {
                         type: 'rematch',
-                        playerSymbol: p.symbol,
                         gameState: game.gameState,
                         currentPlayer: game.currentPlayer
-                    }));
-                });
-                console.log(`Game ${games.indexOf(game)} rematch started`);
-            } else if (data.type === 'leave') {
-                game.players = game.players.filter(p => p.ws !== ws);
-                if (game.players.length) {
-                    game.players[0].ws.send(JSON.stringify({ type: 'opponent_left' }));
-                    console.log(`Player left game ${games.indexOf(game)}. Remaining players: ${game.players.length}`);
-                } else {
-                    console.log(`Game ${games.indexOf(game)} empty, removing`);
-                    games.splice(games.indexOf(game), 1);
-                }
+                    });
+                    break;
+                case 'leave':
+                    removePlayer(game, ws);
+                    break;
             }
-        } catch (e) {
-            console.error('Invalid message:', e);
+        } catch (err) {
+            console.error('Invalid message:', err);
         }
     });
 
     ws.on('close', () => {
-        game.players = game.players.filter(p => p.ws !== ws);
-        if (game.players.length) {
-            game.players[0].ws.send(JSON.stringify({ type: 'opponent_left' }));
-            console.log(`Player disconnected from game ${games.indexOf(game)}. Remaining players: ${game.players.length}`);
-        } else {
-            console.log(`Game ${games.indexOf(game)} empty, removing`);
-            games.splice(games.indexOf(game), 1);
-        }
+        removePlayer(game, ws);
     });
 });
 
-console.log(`Server running on port ${process.env.PORT || 8080}`);
+function broadcast(game, message) {
+    game.players.forEach(p => {
+        p.ws.send(JSON.stringify(message));
+    });
+}
+
+function removePlayer(game, ws) {
+    game.players = game.players.filter(p => p.ws !== ws);
+    if (game.players.length === 0) {
+        console.log(`Game ${game.id} is empty. Removing.`);
+        games.splice(games.indexOf(game), 1);
+    } else {
+        game.players[0].ws.send(JSON.stringify({ type: 'opponent_left' }));
+        console.log(`Player left game ${game.id}. One player remains.`);
+    }
+}
+
+// Clean up inactive games every 10 minutes
+setInterval(() => {
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    games.forEach((game, index) => {
+        if (game.players.length === 1 && game.lastActivity < cutoff) {
+            console.log(`Removing stale game ${game.id}`);
+            game.players[0].ws.close();
+            games.splice(index, 1);
+        }
+    });
+}, 5 * 60 * 1000); // Run every 5 minutes
+
+console.log(`WebSocket server running on port ${process.env.PORT || 8080}`);
